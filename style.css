@@ -1,0 +1,5 @@
+.retenir{border:1px solid #2E6DB4;background:#eef4fb;border-radius:4px;padding:10px 14px;margin:12px 0}
+.retenir:before{content:"À retenir";display:block;font-weight:600;color:#2E6DB4;margin-bottom:4px}
+.attention{border:1px solid #D85A30;background:#fbf0ec;border-radius:4px;padding:10px 14px;margin:12px 0}
+.attention:before{content:"Attention";display:block;font-weight:600;color:#D85A30;margin-bottom:4px}
+body{font-size:15px;line-height:1.6} pre{font-size:12.5px}

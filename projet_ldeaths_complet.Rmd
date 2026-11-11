@@ -1,0 +1,671 @@
+---
+title: "Décès mensuels par maladies pulmonaires au Royaume-Uni (1974-1979)"
+subtitle: "Projet complet de séries temporelles : notions, choix justifiés, modélisation, prévision et détection d'excès (Serfling)"
+author: "Christian TOSSE — M2 Mathématiques des Données"
+date: "Novembre 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    css: style.css
+    pandoc_args: ["--lua-filter=boxes.lua"]
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    highlight: tango
+    includes:
+      in_header: header.tex
+    pandoc_args: ["--lua-filter=boxes.lua"]
+geometry: "margin=2.1cm"
+fontsize: 11pt
+linkcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "##",
+                      fig.width = 8, fig.height = 3.6, fig.align = "center", out.width = "100%")
+if (knitr::is_latex_output()) knitr::opts_chunk$set(dev = "cairo_pdf", fig.pos = "H")
+```
+
+# Introduction {-}
+
+## Objectif {-}
+
+En **surveillance sanitaire**, la question centrale est la suivante : *une hausse du nombre de décès est-elle anormale, ou n'est-ce que la saison habituelle ?* Pour y répondre, il faut savoir combien de décès sont **attendus** chaque mois, puis repérer les mois où l'observé dépasse nettement cet attendu.
+
+Ce projet traite cette question sur une série réelle de santé publique, la série `ldeaths` de R. Il est construit pour être **lu et compris pas à pas** :
+
+* chaque **notion** est expliquée avant d'être utilisée ;
+* chaque **choix** est justifié, en montrant aussi les options rejetées et la raison de leur rejet ;
+* chaque **ligne de code** est commentée ;
+* chaque **sortie et chaque graphique** est interprété.
+
+## Plan {-}
+
+1. Les données : comment se présente une série temporelle.
+2. Exploration : chronogramme, saisonnalité, stationnarité, ACF et PACF.
+3. Décomposition additive : lecture de chaque panneau.
+4. La référence de prévision : le naïf saisonnier.
+5. Rappels : les modèles AR, MA, ARMA, SARIMA et leur identification.
+6. Option 1 (rejetée) : un AR sur la série brute.
+7. Option 2 (testée) : un modèle SARIMA.
+8. Option 3 (retenue) : régression harmonique avec erreurs AR(2).
+9. Validation du modèle retenu.
+10. Prévision de 1979 et comparaison de tous les modèles.
+11. Modèle de Serfling et seuil épidémique.
+12. Conclusion, limites, et préparation de l'entretien.
+
+Tout le code utilise R. Les seuls packages nécessaires sont `stats` et `graphics`, déjà installés avec R, ainsi que `knitr` pour compiler ce document.
+
+# Les données : comment se présente une série temporelle
+
+## Une série temporelle n'est pas un tableau « individus × variables »
+
+Dans un jeu de données classique, chaque ligne est un **individu** (un patient, un pays…), et l'ordre des lignes n'a aucune importance : on peut les mélanger. On suppose en général que les individus sont indépendants.
+
+Dans une série temporelle, il n'y a souvent qu'**un seul individu**, ici le Royaume-Uni, observé **à intervalles réguliers**. Chaque ligne est une **date**. **L'ordre des lignes est l'information elle-même**, et on ne mélange jamais les lignes. La valeur d'un mois dépend des précédentes : c'est justement cette dépendance qu'on modélise.
+
+| | Données classiques | Série temporelle | Série multivariée |
+|---|---|---|---|
+| Une ligne = | un individu | une date | une date |
+| Colonnes | plusieurs variables | une variable | plusieurs variables |
+| L'ordre des lignes | n'a pas d'importance | **est l'information** | **est l'information** |
+| Hypothèse type | individus indépendants | dépendance au passé | dépendance au passé et entre séries |
+| Exemple | âge, sexe, IMC de patients | décès mensuels | décès hommes et femmes (`mdeaths`, `fdeaths`) |
+
+Il existe un cas intermédiaire : les **données de panel**, où **plusieurs individus** sont suivis à **plusieurs dates** (par exemple les décès mensuels de chaque région). Elles combinent les deux logiques et feront l'objet d'un prochain projet.
+
+## Charger la série et lire sa structure
+
+```{r donnees}
+y <- ldeaths                 # la série est fournie avec R : on la copie dans un objet nommé y
+y                            # affichage en tableau années × mois (uniquement pour la lecture)
+```
+
+**Attention : ce tableau années × mois n'est qu'un affichage.** En mémoire, un objet `ts` est un simple **vecteur de 72 nombres**, accompagné d'un **calendrier** : la date de début, la date de fin et la fréquence.
+
+```{r structure}
+class(y)                     # "ts" : objet série temporelle (valeurs + calendrier)
+head(as.numeric(y), 13)      # le vecteur brut : les 13 premières valeurs, mises bout à bout
+tsp(y)                       # le calendrier : début (1974.000), fin (1979.917), fréquence (12)
+frequency(y)                 # 12 observations par an : données mensuelles
+length(y)                    # 72 observations au total (6 ans × 12 mois)
+summary(y)                   # résumé : minimum, quartiles, moyenne, maximum
+```
+
+**Interprétation.**
+
+* Grâce au calendrier, R sait que la 13ᵉ valeur (`r as.numeric(y)[13]`) correspond à **janvier 1975**. C'est ce qui lui permet de dessiner l'axe du temps et de calculer la saison.
+* On compte en moyenne **`r round(mean(y))` décès par mois**, avec un écart énorme entre le minimum (`r min(y)`) et le maximum (`r max(y)`, en février 1976). Tout le projet consiste à **expliquer cet écart**.
+* Si des données arrivent en **format long**, avec une colonne `date` et une colonne `deces`, on les transforme en `ts` avec `ts(df$deces, start = c(1974, 1), frequency = 12)`.
+
+## Séparer apprentissage et test
+
+```{r decoupage}
+y_train <- window(y, end = c(1978, 12))    # 1974-1978 : les 60 mois qui servent à estimer
+y_test  <- window(y, start = c(1979, 1))   # 1979 : 12 mois cachés au modèle, pour juger les prévisions
+n_train <- length(y_train)                 # taille de l'échantillon d'apprentissage (60)
+h       <- length(y_test)                  # horizon de prévision (12 mois)
+c(n_train = n_train, h = h)                # vérification des deux tailles
+```
+
+**Pourquoi ce choix ?** Juger un modèle sur les données qui ont servi à l'estimer est trop facile : il les « connaît » déjà. On cache donc la dernière année au modèle. On l'estime sur `r n_train` mois, puis on compare ses prévisions pour 1979 aux vraies valeurs. C'est une **validation hors échantillon**, la façon honnête de juger un modèle de prévision.
+
+# Exploration de la série
+
+## Chronogramme
+
+```{r chronogramme}
+par(mar = c(4, 4.5, 2, 1), las = 1)                       # marges du graphique, étiquettes horizontales
+plot(y, lwd = 2, col = "#2E6DB4", xlab = "Année", ylab = "Nombre de décès",
+     main = "Décès mensuels par maladies pulmonaires, Royaume-Uni")  # trace la série dans le temps
+abline(v = 1979, lty = 2, col = "grey40")                 # trait vertical : début de la période de test
+```
+
+**Lecture.** Le même motif revient chaque année : un **pic en hiver** et un **creux en été**. C'est une **saisonnalité de période 12 mois**. Les pics n'ont pas tous la même hauteur : celui de l'hiver 1975-1976 est bien plus haut. Ce sont précisément ces écarts à la saison « normale » qui intéressent la surveillance.
+
+## Profil par mois
+
+```{r monthplot}
+par(mar = c(4, 4.5, 2, 1), las = 1)                       # mêmes réglages graphiques
+monthplot(y, col = "#2E6DB4", ylab = "Nombre de décès",
+          main = "Valeurs regroupées par mois (trait horizontal = moyenne du mois)")
+```
+
+**Lecture.** On compte environ 2 900 décès en janvier-février, contre environ 1 400 de juillet à septembre. **Le mois de l'année explique à lui seul l'essentiel des variations.**
+
+## La série est-elle stationnaire ?
+
+**Notion.** Une série est **stationnaire** si ses propriétés statistiques ne changent pas dans le temps : une moyenne constante, une variance constante, et une corrélation entre deux dates qui ne dépend que de leur écart. Les modèles AR, MA et ARMA **exigent** cette propriété.
+
+On la juge **d'abord à l'œil, sur le chronogramme**, en posant trois questions :
+
+| Question | Si la réponse est… | Problème | Remède |
+|---|---|---|---|
+| Le niveau moyen reste-t-il constant ? | non | tendance | différencier, ou régresser sur le temps |
+| Un motif se répète-t-il à intervalle fixe ? | oui | saison | différence saisonnière, ou harmoniques |
+| L'amplitude des oscillations est-elle constante ? | non | variance non constante | logarithme |
+
+Pour `ldeaths`, la deuxième question suffit : **la saison est évidente, donc la série n'est pas stationnaire**. On le confirme avec l'ACF.
+
+## Autocorrélations de la série brute
+
+**Notions.**
+
+* L'**ACF** au retard $h$ est la corrélation entre la valeur d'un mois et celle de $h$ mois plus tôt. Elle mêle les liens directs et indirects.
+* La **PACF** au retard $h$ est la même corrélation, une fois retiré l'effet des mois intermédiaires. C'est le lien **direct** seulement.
+* Les pointillés valent $\pm 2/\sqrt{n}$. Une barre qui les dépasse est significative au seuil d'environ 5 %.
+
+```{r acf_brute, fig.height=3.4}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1), las = 1)            # deux graphiques côte à côte
+acf(y_train, lag.max = 36, main = "ACF de la série brute")       # corrélation entre y(t) et y(t-h)
+pacf(y_train, lag.max = 36, main = "PACF de la série brute")     # corrélation directe au retard h
+round(acf(y_train, plot = FALSE, lag.max = 12)$acf[-1], 2)       # valeurs de l'ACF, retards 1 à 12
+```
+
+::: attention
+**Lecture de l'axe.** Pour un objet `ts` mensuel, l'axe « Lag » est en **années** : 1,0 correspond à 12 mois et 0,5 à 6 mois.
+:::
+
+**Lecture.** L'ACF forme une **vague de période 12** qui décroît très lentement : environ +0,74 à 1 mois, −0,69 à 6 mois, +0,68 à 12 mois. Un mois de janvier ressemble au janvier précédent et pas à un mois de juillet. C'est la signature d'une **série non stationnaire à cause de la saison**. À ce stade, **la PACF n'est pas interprétable** pour choisir un ordre : il faut d'abord traiter la saison.
+
+\newpage
+
+# Décomposition additive : un plan pour le modèle
+
+## Additif ou multiplicatif ? Le choix, preuve à l'appui
+
+**Notion.** On décompose une série en **tendance + saison + reste**. Il existe deux grandes façons d'assembler ces trois morceaux :
+
+* **additive** : $y_t = T_t + S_t + u_t$. La saison **ajoute un nombre fixe** de décès, par exemple +950 en février chaque année ;
+* **multiplicative** : $y_t = T_t \times S_t \times u_t$. La saison **ajoute un pourcentage**, par exemple +45 % en février. Dans ce cas, les vagues grandissent quand le niveau monte.
+
+**Le test** : l'amplitude saisonnière (l'écart entre le mois le plus haut et le mois le plus bas d'une année) grandit-elle avec le niveau moyen de l'année ?
+
+```{r choix_additif}
+annee     <- floor(time(y))                          # l'année de chaque observation
+niveau    <- tapply(y, annee, mean)                  # niveau moyen de chaque année
+amplitude <- tapply(y, annee, function(v) max(v) - min(v))   # amplitude de chaque année (max - min)
+round(cbind(niveau, amplitude, ratio = amplitude / niveau), 2)   # tableau récapitulatif par année
+cor(niveau, amplitude)                               # corrélation entre le niveau et l'amplitude
+```
+
+**Lecture.** La corrélation niveau–amplitude vaut `r round(cor(niveau, amplitude), 2)`, c'est-à-dire qu'elle est quasi nulle. Entre 1974 et 1979, le niveau baisse d'environ 12 %, alors que l'amplitude ne diminue pas : c'est l'inverse de ce qu'impliquerait un schéma multiplicatif. L'année 1976, atypique, correspond à une épidémie. Une série multiplicative aurait des vagues qui grossissent régulièrement avec le niveau, comme `AirPassengers`. **On retient donc le modèle additif.** Si la série avait été multiplicative, on aurait pris le logarithme, puisque $\log(T\times S\times u)=\log T+\log S+\log u$ redevient additif.
+
+## La décomposition
+
+```{r decomposition, fig.height=6.5}
+dec <- decompose(y_train)          # décomposition additive (type = "additive" par défaut)
+plot(dec)                          # 4 panneaux : observé, tendance, saison, reste
+round(dec$figure)                  # les 12 coefficients saisonniers (écart au niveau de la tendance)
+```
+
+## Lecture de chaque panneau
+
+**Exemple concret, février 1976.** L'observé vaut 3 891 décès, la tendance `r round(dec$trend[26])`, la saison `r round(dec$seasonal[26])` et le reste `r round(dec$random[26])`. On vérifie que $`r round(dec$trend[26])` + `r round(dec$seasonal[26])` + `r round(dec$random[26])` = `r round(dec$trend[26]+dec$seasonal[26]+dec$random[26])`$ : la décomposition **découpe chaque valeur en trois morceaux qui s'additionnent**.
+
+::: attention
+**Chaque panneau a sa propre échelle verticale.** La tendance paraît agitée, mais elle ne varie que d'environ 300 décès. La saison varie de plus de 1 600. Il faut toujours lire les chiffres de l'axe avant de comparer deux panneaux.
+:::
+
+* **observed** : la série brute, qui sert de point de départ.
+* **trend** : pour chaque mois, R fait la moyenne des 12 mois qui l'entourent. Sur une année complète, pics et creux se compensent : la saison disparaît, et il reste le **niveau moyen**. Il faut 6 mois de chaque côté pour faire ce calcul, c'est pourquoi la courbe **commence en juillet 1974 et s'arrête en juin 1978**. Le niveau passe d'environ 2 200 décès par mois à environ 1 980, soit une **baisse lente d'environ 10 %**. La petite bosse fin 1975 – début 1976 vient du pic de février 1976, qui fait monter la moyenne des mois voisins.
+* **seasonal** : R retire la tendance, puis fait la moyenne de ce qui reste pour chaque mois. On obtient **12 nombres répétés à l'identique chaque année**, de somme nulle : de `r min(round(dec$figure))` (septembre) à +`r max(round(dec$figure))` (février). La saison **domine** la série : son amplitude est environ 5 fois la variation de la tendance.
+* **random** : le reste vaut observé − tendance − saison. On y repère les **anomalies** : +763 en février 1976 (un hiver beaucoup plus meurtrier que la normale), −677 en février 1977 (un hiver calme). Son écart-type vaut environ `r round(sd(dec$random, na.rm = TRUE))` décès. Il oscille autour de 0 sans motif évident, mais garde une petite mémoire d'un mois à l'autre, qu'on modélisera plus loin.
+
+## Ce que la décomposition apporte au modèle
+
+La décomposition ne sert pas directement au calcul : elle sert de **plan**. Elle montre **quels morceaux il faut modéliser** :
+
+| Panneau | Ce qu'il montre | Ce qu'on mettra dans le modèle |
+|---|---|---|
+| trend | une baisse lente et régulière | une **droite** $a + b\,t$ |
+| seasonal | la même vague chaque année | une **vague fixe de période 12** (harmoniques) |
+| random | des écarts avec une petite mémoire | un **AR(p)** |
+
+On n'utilise pas directement les chiffres de `decompose()` : sa tendance **s'arrête 6 mois avant la fin** des données et n'a **pas de formule**, donc elle ne se prolonge pas dans le futur. Une droite et une vague, elles, se prolongent sans difficulté.
+
+::: retenir
+Il existe d'autres méthodes de décomposition : `stl()`, qui accepte une saison évolutive et résiste aux valeurs extrêmes, et X‑13‑ARIMA‑SEATS, la méthode officielle de l'Insee. Pour une saison stable comme ici, `decompose()` suffit.
+:::
+
+# La référence de prévision : le naïf saisonnier
+
+**Principe.** C'est la prévision **la plus simple possible** : pour chaque mois de 1979, on prend la valeur du même mois de 1978. Elle ne demande aucun modèle. **Tout modèle sérieux doit faire mieux.**
+
+```{r naif}
+prev_naif <- ts(as.numeric(window(y_train, start = c(1978, 1))),   # les 12 valeurs de 1978...
+                start = c(1979, 1), frequency = 12)                 # ...recopiées comme prévisions de 1979
+rmse <- function(obs, prev) sqrt(mean((obs - prev)^2))              # racine de l'erreur quadratique moyenne
+tab_naif <- data.frame(mois = month.abb,                            # tableau de construction
+                       val_1978 = as.numeric(prev_naif),
+                       obs_1979 = as.numeric(y_test),
+                       erreur = as.numeric(y_test - prev_naif))
+tab_naif                                                            # affichage
+rmse(y_test, prev_naif)                                             # RMSE du naïf saisonnier
+```
+
+**Le critère RMSE.** $\text{RMSE}=\sqrt{\frac{1}{h}\sum_{t}(y_t-\widehat y_t)^2}$. Elle s'exprime dans l'unité de la série, ici en **décès**. Plus elle est petite, meilleure est la prévision. Le naïf saisonnier obtient **`r round(rmse(y_test, prev_naif))` décès** : c'est la **barre à battre**.
+
+# Rappels : les modèles et leur identification
+
+## Les modèles de base
+
+Ici, $\varepsilon_t$ est un **choc** imprévisible (bruit blanc) et $B$ est l'opérateur retard : $By_t=y_{t-1}$.
+
+| Modèle | Équation | Ce que ça veut dire |
+|---|---|---|
+| **AR(p)** | $y_t = \varphi_1 y_{t-1} + \dots + \varphi_p y_{t-p} + \varepsilon_t$ | le présent dépend des $p$ **dernières valeurs** ; un choc s'éteint progressivement |
+| **MA(q)** | $y_t = \varepsilon_t + \theta_1\varepsilon_{t-1} + \dots + \theta_q\varepsilon_{t-q}$ | le présent dépend des $q$ **derniers chocs** ; un choc disparaît net après $q$ mois |
+| **ARMA(p,q)** | les deux à la fois | mémoire des valeurs et des chocs passés |
+| **ARIMA(p,d,q)** | ARMA sur $(1-B)^d y_t$ | pour une série avec tendance : on modélise les variations |
+| **SARIMA(p,d,q)(P,D,Q)$_{12}$** | ARIMA + le même mécanisme à l'échelle de 12 mois | pour une série saisonnière |
+
+AR, MA et ARMA supposent une série **stationnaire**. ARIMA et SARIMA la rendent stationnaire par différenciation.
+
+## Reconnaître un modèle sur l'ACF et la PACF
+
+```{r signatures, fig.height=6.4}
+par(mfrow = c(3, 2), mar = c(3.5, 4, 2.2, 1), las = 1)      # grille de 3 × 2 graphiques
+sig <- function(ar = numeric(), ma = numeric(), nom) {      # trace l'ACF et la PACF théoriques d'un modèle
+  a <- ARMAacf(ar = ar, ma = ma, lag.max = 15)[-1]          # ACF théorique (on retire le retard 0)
+  p <- ARMAacf(ar = ar, ma = ma, lag.max = 15, pacf = TRUE) # PACF théorique
+  plot(a, type = "h", lwd = 4, col = "#2E6DB4", main = paste("ACF", nom), xlab = "Retard", ylab = ""); abline(h = 0)
+  plot(p, type = "h", lwd = 4, col = "#D85A30", main = paste("PACF", nom), xlab = "Retard", ylab = ""); abline(h = 0)
+}
+sig(ar = 0.7, nom = "AR(1)")                 # AR(1) : ACF décroissante, PACF coupée après 1
+sig(ar = c(0.5, 0.3), nom = "AR(2)")         # AR(2) : PACF coupée après 2
+sig(ma = 0.8, nom = "MA(1)")                 # MA(1) : ACF coupée après 1, PACF décroissante
+```
+
+| Ce que tu vois | Modèle |
+|---|---|
+| la **PACF** coupe net au retard $p$, l'ACF décroît | **AR(p)** : la PACF donne $p$ |
+| l'**ACF** coupe net au retard $q$, la PACF décroît | **MA(q)** : l'ACF donne $q$ |
+| les deux décroissent sans coupure | **ARMA** : on choisit l'ordre par AIC |
+| l'ACF décroît très lentement ou forme une vague | **non stationnaire** : il faut traiter la série d'abord |
+
+**Moyen mnémotechnique** : l'**A**R se lit sur la P**A**CF, le **M**A se lit sur l'ACF. **Méthode** : regarder la série, puis chercher le graphique qui coupe net, puis vérifier que les résidus du modèle estimé forment un bruit blanc.
+
+# Option 1 (rejetée) : un AR directement sur la série brute
+
+On fait volontairement l'erreur de traiter la série comme si elle était stationnaire, pour voir ce qui se passe.
+
+```{r ar_brut}
+ar_brut <- ar(y_train, aic = TRUE, order.max = 15)      # AR sur la série brute, ordre choisi par AIC (Yule-Walker)
+ar_brut$order                                           # ordre retenu
+prev_ar_brut <- predict(ar_brut, n.ahead = h)$pred      # prévisions des 12 mois de 1979
+rmse(y_test, prev_ar_brut)                              # RMSE à comparer au naïf saisonnier
+```
+
+**Lecture.** L'AR(`r ar_brut$order`) obtient une RMSE de **`r round(rmse(y_test, prev_ar_brut))`**, soit **pire que le naïf saisonnier** (`r round(rmse(y_test, prev_naif))`). Un AR(`r ar_brut$order`) ne voit que `r ar_brut$order` mois en arrière : il ne peut pas reproduire un cycle de 12 mois, et ses prévisions retombent vers la moyenne globale (environ 2 000).
+
+::: attention
+**Leçon.** On ne peut pas appliquer un AR à une série saisonnière sans traiter d'abord la saison. Deux façons de le faire sont étudiées ci-dessous : **effacer** la saison par différence (SARIMA), ou la **décrire** par une formule (régression harmonique).
+:::
+
+# Option 2 (testée) : un modèle SARIMA
+
+## Effacer la saison par différence saisonnière
+
+**Idée.** On compare chaque mois au même mois de l'année précédente, $y_t - y_{t-12}$, ce qui fait disparaître la saison. On modélise ensuite ce qui reste, mois par mois et année par année.
+
+```{r sarima_diff, fig.height=3.4}
+d12 <- diff(y_train, lag = 12)                                     # différence saisonnière y(t) - y(t-12)
+length(d12)                                                        # on perd la première année : 48 mois restent
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1), las = 1)
+acf(d12, lag.max = 30, main = "ACF de y(t) - y(t-12)")             # la vague a disparu
+pacf(d12, lag.max = 30, main = "PACF de y(t) - y(t-12)")           # pics aux retards 2 et 12
+```
+
+**Lecture.** La vague a disparu : la série différenciée est stationnaire. Il reste des barres significatives aux retards **2** et **12** (sur l'axe : 0,17 et 1,0). Le pic à 12 suggère une partie saisonnière d'ordre 1 (SAR(1) ou SMA(1)). Le pic au retard 2 suggère une partie non saisonnière courte (AR(1) ou AR(2), ou MA(2)).
+
+## Comparer plusieurs candidats
+
+```{r sarima_candidats}
+candidats <- list(c(0,0,2,0,1,1), c(1,0,0,0,1,1), c(1,0,0,1,1,0), c(2,0,0,1,1,0))   # (p,d,q,P,D,Q)
+res <- t(sapply(candidats, function(m) {                                            # pour chaque candidat
+  f <- arima(y_train, order = m[1:3], seasonal = list(order = m[4:6], period = 12), method = "ML")  # estimation
+  p <- predict(f, n.ahead = h)                                                      # prévision de 1979
+  k <- sum(m[c(1, 3, 4, 6)])                                                        # nombre de paramètres ARMA
+  c(AIC  = AIC(f),                                                                  # critère d'information
+    RMSE = rmse(y_test, p$pred),                                                    # erreur de prévision hors échantillon
+    LjungBox_p = Box.test(residuals(f), lag = 24, type = "Ljung", fitdf = k)$p.value)  # résidus = bruit blanc ?
+}))
+rownames(res) <- sapply(candidats, function(m)                                      # noms lisibles des modèles
+  sprintf("SARIMA(%d,%d,%d)(%d,%d,%d)12", m[1], m[2], m[3], m[4], m[5], m[6]))
+round(res, 2)                                                                       # tableau de comparaison
+```
+
+**Lecture et piège important.**
+
+1. Tous les candidats ont des résidus qui forment un bruit blanc (p > 0,05).
+2. Le modèle de **meilleur AIC** (SARIMA(0,0,2)(0,1,1)$_{12}$) **prévoit mal 1979** : sa RMSE est à peine meilleure que celle du naïf saisonnier. **L'AIC mesure l'ajustement au passé, pas la qualité de la prévision** : c'est pour cela qu'on garde une année de test.
+3. Le meilleur SARIMA en prévision, **SARIMA(2,0,0)(1,1,0)$_{12}$**, atteint une RMSE de **`r round(res[4,"RMSE"])`**.
+4. Ce choix est fragile : la différence saisonnière fait perdre une année, et il ne reste que 48 mois pour estimer.
+
+\newpage
+
+# Option 3 (retenue) : régression harmonique avec erreurs AR(2)
+
+## Étape 1 : la régression que tu connais
+
+Une droite dans le temps :
+$$y_t = a + b\,t + \varepsilon_t,$$
+où $t$ est le numéro du mois (1 pour janvier 1974, …, 60 pour décembre 1978), et **$a$, $b$ sont 2 constantes à estimer par moindres carrés**. Problème : une droite ne peut pas monter en hiver et descendre en été. Il faut d'autres variables explicatives.
+
+## Étape 2 : quatre variables explicatives calculées à partir de $t$
+
+On crée 4 colonnes, **calculées à partir de $t$** :
+
+* $x_1=\cos(2\pi t/12)$ et $x_2=\sin(2\pi t/12)$ : une vague de période 12 mois ;
+* $x_3=\cos(2\pi t/6)$ et $x_4=\sin(2\pi t/6)$ : une vague de période 6 mois, qui corrige la forme de la première.
+
+```{r colonnes}
+harmoniques <- function(tt, K) {                    # fabrique les colonnes cos/sin pour les temps tt
+  M <- NULL                                         # matrice vide au départ
+  for (k in 1:K) M <- cbind(M, cos(2 * pi * k * tt / 12), sin(2 * pi * k * tt / 12))  # une paire par vague
+  colnames(M) <- paste0(rep(c("x_cos", "x_sin"), K), rep(1:K, each = 2))               # noms lisibles
+  M                                                 # on renvoie la matrice
+}
+t_train <- 1:n_train                                # temps 1 à 60 (apprentissage)
+t_test  <- (n_train + 1):(n_train + h)              # temps 61 à 72 (1979)
+tab <- data.frame(t = t_train, mois = rep(month.abb, 5), y = as.numeric(y_train),
+                  round(harmoniques(t_train, 2), 2))   # le tableau de données de la régression
+tab[c(1:3, 12:13), ]                                # lignes de janvier, février, mars, décembre 1974 et janvier 1975
+```
+
+**La seule chose à retenir :** les valeurs de $x_1, x_2, x_3, x_4$ **se répètent tous les 12 mois**. Janvier 1975 (t = 13) a exactement les mêmes valeurs que janvier 1974 (t = 1). Ces colonnes servent donc d'**étiquette du mois de l'année**, comme des indicatrices de mois, mais avec beaucoup moins de colonnes.
+
+## Étape 3 : une régression linéaire multiple ordinaire
+
+$$y_t = a + b\,t + c_1x_1 + c_2x_2 + c_3x_3 + c_4x_4 + \varepsilon_t .$$
+
+C'est exactement comme une régression du type salaire = a + b·âge + c·diplôme. Il y a **6 constantes à estimer** : $a, b, c_1, c_2, c_3, c_4$, par **moindres carrés**.
+
+## Choisir le nombre de vagues K
+
+Chaque vague ajoute 2 colonnes. On compare $K = 1, 2, 3$ par l'AIC.
+
+```{r choix_K}
+choix_K <- t(sapply(1:3, function(K) {                            # pour K = 1, 2, 3
+  f <- lm(y_train ~ t_train + harmoniques(t_train, K))            # régression par moindres carrés
+  c(K = K, nb_coef = 2 + 2 * K, AIC = AIC(f), R2_ajuste = summary(f)$adj.r.squared)
+}))
+round(choix_K, 3)                                                 # tableau de comparaison
+```
+
+```{r figure_K, fig.height=3.4}
+prof <- tapply(y_train - mean(y_train), cycle(y_train), mean)     # profil saisonnier moyen observé
+mm <- seq(1, 12, by = 0.05)                                       # grille fine pour tracer des courbes lisses
+par(mar = c(4, 4.5, 2, 1), las = 1)
+plot(1:12, prof, pch = 19, col = "#2E6DB4", xaxt = "n", ylim = c(-900, 1100), xlab = "",
+     ylab = "Écart au niveau moyen", main = "Profil saisonnier et courbes à K = 1, 2, 3 vagues")
+axis(1, 1:12, month.abb)                                          # mois en abscisse
+cols <- c("grey50", "#D85A30", "#1D9E75")
+for (K in 1:3) {                                                  # ajuste le profil avec K vagues et trace la courbe
+  cf <- coef(lm(prof ~ harmoniques(1:12, K)))
+  lines(mm, cbind(1, harmoniques(mm, K)) %*% cf, col = cols[K], lwd = 2, lty = c(2, 1, 3)[K])
+}
+legend("top", c("observé", "K = 1", "K = 2", "K = 3"), pch = c(19, NA, NA, NA), lty = c(NA, 2, 1, 3),
+       col = c("#2E6DB4", cols), lwd = 2, bty = "n", horiz = TRUE, cex = 0.85)
+```
+
+**Lecture.** Avec **K = 1**, la forme générale est bonne, mais le pic de février est sous-estimé et le creux d'été trop arrondi. Avec **K = 2**, le pic pointu de l'hiver et le long creux plat de l'été sont bien rendus, et **l'AIC est minimal**. Avec **K = 3**, le gain est trop faible pour 2 paramètres de plus : l'AIC remonte. **On retient K = 2.** (Avec K = 6, la courbe passerait par les 12 points, ce qui équivaut à 11 indicatrices de mois : aucune économie.)
+
+## Estimation et lecture des coefficients
+
+```{r reg_saison}
+K <- 2                                                           # nombre de vagues retenu
+reg <- lm(y_train ~ t_train + harmoniques(t_train, K))           # régression : droite + 2 vagues
+summary(reg)                                                     # tableau des coefficients
+```
+
+```{r coefs_val, include=FALSE}
+cr <- coef(reg)
+```
+
+$$\widehat y_t = `r round(cr[1])` `r round(cr[2],1)`\,t + `r round(cr[3])`\,x_1 + `r round(cr[4])`\,x_2 `r round(cr[5])`\,x_3 + `r round(cr[6])`\,x_4$$
+
+* **a = `r round(cr[1])`** est le niveau de départ, une fois la saison retirée. **b = `r round(cr[2],1)`** (p = 0,008) indique que les décès baissent d'environ 5 par mois, soit 60 par an.
+* **$c_1$, $c_2$** sont très significatifs : c'est la vague annuelle, d'amplitude $\sqrt{c_1^2+c_2^2}\approx `r round(sqrt(cr[3]^2+cr[4]^2))`$ décès, avec un pic début février.
+* **$c_4$** est significatif : c'est la correction qui rend le pic d'hiver pointu. **$c_3$** ne l'est pas, mais on garde la paire complète, car un cosinus et un sinus de même période forment une seule vague.
+* **R² ajusté = `r round(summary(reg)$adj.r.squared, 2)`** : la tendance et la saison expliquent 85 % des variations.
+
+## On utilise la formule comme n'importe quelle régression
+
+```{r exemples_calcul}
+x_fev74 <- harmoniques(2, K)                                     # colonnes x pour février 1974 (t = 2)
+sum(cr * c(1, 2, x_fev74))                                       # valeur prédite pour février 1974
+x_jan79 <- harmoniques(61, K)                                    # colonnes x pour janvier 1979 (t = 61)
+sum(cr * c(1, 61, x_jan79))                                      # prévision (partie régression) de janvier 1979
+```
+
+Pour prévoir un mois futur, **il suffit de connaître $t$** : les colonnes $x$ se calculent d'avance, et la droite se prolonge. C'est ce qui rend ce modèle facile à utiliser pour la prévision et pour la surveillance.
+
+## Les erreurs de la régression sont-elles indépendantes ?
+
+```{r residus_reg, fig.height=3.4}
+u <- resid(reg)                                                  # u(t) = écart à la saison normale
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1), las = 1)
+acf(u, lag.max = 24, main = "ACF des erreurs u")                 # la vague a-t-elle disparu ?
+pacf(u, lag.max = 24, main = "PACF des erreurs u")               # reste-t-il un lien direct ?
+round(pacf(u, plot = FALSE, lag.max = 6)$acf[, 1, 1], 2)         # PACF aux retards 1 à 6
+2 / sqrt(n_train)                                                # bande de significativité
+```
+
+**Lecture (méthode du quiz).** La vague a disparu : la saison est bien retirée, et $u$ est stationnaire. La PACF vaut −0,26 au retard 2, juste à la limite de la bande (0,26), puis plus rien : c'est l'empreinte d'un **AR(2)**. Les erreurs gardent une petite mémoire : quand un mois est anormalement haut, le mois situé deux mois plus tard tend à être un peu plus bas.
+
+**Pourquoi ne pas s'arrêter là ?** Des erreurs autocorrélées rendent les écarts-types des MCO **faux**, donc les tests aussi. De plus, cette mémoire est une information utile **pour prévoir**.
+
+## Estimation conjointe : régression + AR(p) sur les erreurs
+
+$$y_t = a + b\,t + c_1x_1+c_2x_2+c_3x_3+c_4x_4 + u_t,\qquad u_t=\varphi_1u_{t-1}+\varphi_2u_{t-2}+\varepsilon_t .$$
+
+On estime **les 8 constantes en même temps** par maximum de vraisemblance, avec `arima()` et l'argument `xreg` (les régresseurs).
+
+```{r choix_p}
+X_train <- cbind(t = t_train, harmoniques(t_train, K))           # régresseurs de l'apprentissage
+X_test  <- cbind(t = t_test,  harmoniques(t_test,  K))           # régresseurs de 1979 (connus d'avance)
+choix_p <- t(sapply(0:3, function(p) {                           # pour p = 0, 1, 2, 3
+  f <- arima(y_train, order = c(p, 0, 0), xreg = X_train, method = "ML")   # régression + AR(p)
+  c(p = p, AIC = AIC(f), BIC = BIC(f))
+}))
+round(choix_p, 1)                                                # comparaison des ordres
+```
+
+L'AIC est minimal pour **p = 2**. Le BIC, plus sévère, hésite avec p = 0. On retient p = 2 pour trois raisons : c'est le minimum de l'AIC, c'est cohérent avec la PACF, et le coefficient $\varphi_2$ est significatif.
+
+```{r modele_final}
+modele <- arima(y_train, order = c(2, 0, 0), xreg = X_train, method = "ML")   # modèle final
+z <- coef(modele) / sqrt(diag(modele$var.coef))                  # statistiques z = estimation / écart-type
+round(cbind(coef = coef(modele), se = sqrt(diag(modele$var.coef)), z = z), 2)  # |z| > 1,96 : significatif
+Mod(polyroot(c(1, -coef(modele)[c("ar1", "ar2")])))              # stationnarité : racines de 1 - phi1 z - phi2 z^2
+```
+
+**Lecture.**
+
+* **$\varphi_1$ = `r round(coef(modele)["ar1"],2)`** n'est pas significatif. **$\varphi_2$ = `r round(coef(modele)["ar2"],2)`** est significatif (|z| ≈ `r round(abs(z["ar2"]),1)`). Une explication plausible est l'**effet de moisson** : après un pic, une partie des personnes les plus fragiles est déjà décédée.
+* Les racines du polynôme AR ont un module de **`r round(Mod(polyroot(c(1, -coef(modele)[c("ar1","ar2")])))[1],2)` > 1** : la partie AR est **stationnaire**.
+* L'écart-type des chocs imprévisibles vaut $\widehat\sigma\approx `r round(sqrt(modele$sigma2))`$ décès.
+
+**Le décompte des paramètres :**
+
+| Partie | Constantes | Nombre |
+|---|---|---|
+| Droite | $a$, $b$ | 2 |
+| Saison | $c_1, c_2, c_3, c_4$ | 4 |
+| **Régression seule** | | **6** |
+| Erreurs AR(2) | $\varphi_1, \varphi_2$ | 2 |
+| **Modèle final** | | **8** |
+
+# Validation du modèle retenu
+
+```{r diagnostic, fig.height=6}
+e <- resid(modele)                                               # résidus = chocs imprévisibles estimés
+par(mfrow = c(2, 2), mar = c(4, 4, 2.5, 1), las = 1)
+plot(e, main = "Résidus dans le temps", ylab = "", col = "#2E6DB4"); abline(h = 0, lty = 2)  # centrés ? motif ?
+acf(e, lag.max = 24, main = "ACF des résidus")                   # toutes les barres dans la bande ?
+hist(e, breaks = 15, main = "Histogramme des résidus", xlab = "", col = "grey80", border = "white")
+qqnorm(e, pch = 19, col = "#2E6DB4"); qqline(e, col = "#D85A30") # comparaison à la loi normale
+```
+
+```{r tests_residus}
+lb <- Box.test(e, lag = 24, type = "Ljung-Box", fitdf = 2)       # H0 : pas d'autocorrélation (retards 1 à 24)
+sw <- shapiro.test(e)                                            # H0 : les résidus suivent une loi normale
+c(LjungBox_p = lb$p.value, Shapiro_p = sw$p.value)               # p-valeurs des deux tests
+```
+
+**Lecture.**
+
+* **Ljung-Box** : p = `r round(lb$p.value, 2)` > 0,05. On ne rejette pas $H_0$ : les résidus sont un **bruit blanc**, et le modèle a capté toute la dépendance temporelle.
+* **Shapiro-Wilk** : p ≈ `r signif(sw$p.value, 2)`. La **normalité est rejetée**, à cause de quelques mois extrêmes (février 1976 surtout), visibles en haut à droite du QQ-plot. Les coefficients restent valables, mais les intervalles de prévision, qui supposent la normalité, sont **approximatifs**. C'est une limite à signaler.
+
+\newpage
+
+# Prévision de 1979 et comparaison de tous les modèles
+
+```{r prevision}
+pr <- predict(modele, n.ahead = h, newxreg = X_test)             # prévision : moyenne + écart-type
+prev <- pr$pred                                                  # prévision ponctuelle
+inf95 <- prev - 1.96 * pr$se                                     # borne basse de l'intervalle à 95 %
+sup95 <- prev + 1.96 * pr$se                                     # borne haute de l'intervalle à 95 %
+data.frame(mois = month.abb, observe = as.numeric(y_test), prevu = round(as.numeric(prev)),
+           inf95 = round(as.numeric(inf95)), sup95 = round(as.numeric(sup95)))   # tableau récapitulatif
+couverture <- mean(y_test >= inf95 & y_test <= sup95)            # part des mois observés dans l'intervalle
+couverture
+```
+
+```{r comparaison}
+comparaison <- c("Naïf saisonnier"               = rmse(y_test, prev_naif),
+                 "Option 1 : AR brut"            = rmse(y_test, prev_ar_brut),
+                 "Option 2 : SARIMA (meilleur AIC)" = res[1, "RMSE"],
+                 "Option 2 : SARIMA (meilleure RMSE)" = res[4, "RMSE"],
+                 "Option 3 : harmoniques + AR(2)" = rmse(y_test, prev))
+round(sort(comparaison))                                         # du meilleur au moins bon
+```
+
+```{r graphique_prevision}
+par(mar = c(3, 4.5, 2, 1), las = 1)
+plot(window(y, start = c(1977, 1)), ylim = c(800, 3600), lwd = 2, xlab = "", ylab = "Décès",
+     main = "Prévision de 1979 : harmoniques + AR(2)")           # série observée 1977-1979
+polygon(c(time(prev), rev(time(prev))), c(inf95, rev(sup95)),
+        col = rgb(0.18, 0.43, 0.71, 0.18), border = NA)          # bande de l'intervalle à 95 %
+lines(prev, col = "#2E6DB4", lwd = 2, lty = 2)                   # prévision du modèle retenu
+lines(prev_naif, col = "#D85A30", lwd = 2, lty = 3)              # référence naïve
+legend("topright", c("Observé", "Prévision du modèle", "Naïf saisonnier", "IP 95 %"),
+       col = c("black", "#2E6DB4", "#D85A30", rgb(0.18, 0.43, 0.71, 0.4)),
+       lty = c(1, 2, 3, 1), lwd = c(2, 2, 2, 8), bty = "n", cex = 0.85)
+```
+
+**Lecture.**
+
+* Le modèle retenu atteint une **RMSE de `r round(rmse(y_test, prev))` décès**, contre `r round(rmse(y_test, prev_naif))` pour le naïf saisonnier : l'erreur baisse d'environ **`r round(100*(1-rmse(y_test, prev)/rmse(y_test, prev_naif)))` %**.
+* **`r round(100*couverture)` %** des mois de 1979 tombent dans l'intervalle à 95 %. Décembre 1979 frôle la borne basse : c'est un mois de décembre inhabituellement calme.
+* Le meilleur SARIMA prévoit **aussi bien** (`r round(res[4,"RMSE"])`). Les deux approches se valent en précision.
+
+## Pourquoi retenir l'option 3 plutôt que le SARIMA ?
+
+| Critère | SARIMA | Harmoniques + AR(2) |
+|---|---|---|
+| Précision sur 1979 | RMSE `r round(res[4,"RMSE"])` | RMSE `r round(rmse(y_test, prev))` |
+| Traitement de la saison | effacée par différence (perte d'un an de données) | décrite par une formule, sur toutes les données |
+| Stabilité du choix | fragile : le meilleur AIC prévoit mal | stable : l'AIC, la PACF et les tests concordent |
+| Niveau « attendu » pour chaque mois | non | **oui** : la partie a + bt + saison |
+| Lien avec la surveillance | indirect | **direct : c'est la base du modèle de Serfling** |
+
+Les deux modèles prévoient aussi bien. L'option 3 est retenue parce qu'elle fournit un **niveau de référence interprétable**, exactement ce dont la surveillance a besoin pour définir une hausse anormale. Le SARIMA serait préférable si la saison **changeait d'une année à l'autre**, ou si la série était longue.
+
+# Modèle de Serfling et seuil épidémique
+
+## Principe
+
+Le modèle de **Serfling (1963)** sert à détecter les excès de mortalité, notamment grippale. Il reprend la régression de l'option 3, en plus simple :
+
+1. le **niveau de base attendu** est une droite plus **une seule** vague annuelle : $y_t=a+bt+\alpha\cos(2\pi t/12)+\beta\sin(2\pi t/12)+\varepsilon_t$, sans terme AR ;
+2. on l'estime **en excluant les mois épidémiques**, pour qu'il représente une année « normale » ;
+3. le **seuil épidémique** est la **borne supérieure de l'intervalle de prévision à 95 %**. Un mois au-dessus déclenche une **alerte**, et l'**excès** vaut observé − attendu.
+
+## Algorithme
+
+```{r serfling_1}
+t_all <- 1:length(y)                                             # temps 1 à 72 (toute la série)
+base <- data.frame(y = as.numeric(y), t = t_all,                 # tableau de travail
+                   cos1 = cos(2 * pi * t_all / 12),              # vague annuelle : cosinus
+                   sin1 = sin(2 * pi * t_all / 12))              # vague annuelle : sinus
+s1 <- lm(y ~ t + cos1 + sin1, data = base)                       # étape 1 : ajustement sur toute la série
+seuil1 <- predict(s1, newdata = base, interval = "prediction", level = 0.95)[, "upr"]  # seuil provisoire
+garder <- base$y <= seuil1                                       # on exclut les mois au-dessus du seuil
+sum(!garder)                                                     # nombre de mois exclus
+```
+
+```{r serfling_2}
+serfling <- lm(y ~ t + cos1 + sin1, data = base[garder, ])       # étape 2 : base « non épidémique »
+round(summary(serfling)$coefficients, 2)                         # coefficients du niveau de base
+ip <- predict(serfling, newdata = base, interval = "prediction", level = 0.95)   # attendu et bornes
+base$attendu <- ip[, "fit"]                                      # décès attendus hors épidémie
+base$seuil   <- ip[, "upr"]                                      # seuil épidémique
+base$alerte  <- base$y > base$seuil                              # TRUE = mois en excès
+base$exces   <- ifelse(base$alerte, base$y - base$attendu, 0)    # nombre de décès en excès
+base$date    <- format(as.Date(paste(floor(time(y)), cycle(y), 1, sep = "-")), "%Y-%m")   # date lisible
+alertes <- base[base$alerte, c("date", "y", "attendu", "seuil", "exces")]                 # mois en alerte
+alertes[, -1] <- round(alertes[, -1])                            # arrondi pour l'affichage
+alertes
+sum(base$exces)                                                  # total des décès en excès
+```
+
+```{r serfling_graphique}
+par(mar = c(3, 4.5, 2, 1), las = 1)
+plot(y, lwd = 2, ylim = c(1000, 4000), xlab = "", ylab = "Décès",
+     main = "Modèle de Serfling : niveau attendu et seuil épidémique")   # série observée
+lines(ts(base$attendu, start = c(1974, 1), frequency = 12), col = "#1D9E75", lwd = 2)       # attendu
+lines(ts(base$seuil, start = c(1974, 1), frequency = 12), col = "#D85A30", lwd = 2, lty = 2) # seuil
+points(time(y)[base$alerte], base$y[base$alerte], pch = 19, col = "#D85A30", cex = 1.4)      # alertes
+legend("topright", c("Observé", "Attendu (base)", "Seuil 95 %", "Alerte"),
+       col = c("black", "#1D9E75", "#D85A30", "#D85A30"), lty = c(1, 1, 2, NA),
+       pch = c(NA, NA, NA, 19), lwd = 2, bty = "n", cex = 0.85)
+```
+
+**Lecture.** Un seul mois est exclu à l'étape 1 (février 1976). Le niveau de base garde une tendance d'environ −5 décès par mois et une vague annuelle très significative. On obtient **`r nrow(alertes)` alertes** : février 1976 (environ +1 074 décès en excès), mars 1976 (environ +500) et janvier 1979 (environ +504), soit environ **`r round(sum(base$exces))` décès en excès** au total. L'hiver 1975-1976 ressort clairement. Il s'agit probablement d'une épidémie de grippe, mais c'est une **hypothèse à vérifier dans la littérature** avant de l'affirmer.
+
+# Conclusion, limites et préparation de l'entretien
+
+## Ce que montre le projet
+
+1. La série est dominée par une **saisonnalité annuelle stable** : le schéma est additif, ce que confirme l'analyse des amplitudes.
+2. Un AR appliqué à la série brute **échoue** : il fait moins bien que la simple reprise des valeurs de l'année précédente.
+3. Deux façons de traiter la saison prévoient aussi bien l'une que l'autre : le **SARIMA** et la **régression harmonique avec erreurs AR(2)**. Elles réduisent d'environ 40 % l'erreur de prévision par rapport au naïf saisonnier.
+4. On retient la régression harmonique parce qu'elle fournit un **niveau attendu**, base du **modèle de Serfling**, qui détecte les mois en excès.
+
+## Limites
+
+* Les résidus **ne sont pas gaussiens** : les intervalles sont approximatifs. Pistes : un modèle de Poisson ou binomial négatif (des comptages de décès), ou des intervalles par bootstrap.
+* La série est **courte** : 6 ans, dont 5 pour estimer.
+* La saison est supposée **identique chaque année**.
+* Le seuil de Serfling dépend des mois exclus. En pratique, on exclut les périodes grippales repérées par des données virologiques.
+
+## Phrase pour la lettre de motivation
+
+> Dans un travail personnel, j'ai modélisé les décès mensuels par maladies pulmonaires au Royaume-Uni par une régression harmonique à erreurs autorégressives AR(2), réduisant d'environ 40 % l'erreur de prévision (RMSE) par rapport à une référence saisonnière, puis mis en œuvre un modèle de Serfling pour détecter les excès de mortalité.
+
+## Questions probables en entretien
+
+| Question | Réponse courte |
+|---|---|
+| Pourquoi un AR seul ne suffit-il pas ? | La série n'est pas stationnaire à cause de la saison ; un AR(5) brut fait pire que le naïf (RMSE 317 contre 266). |
+| Additif ou multiplicatif ? | Additif : l'amplitude saisonnière ne grandit pas avec le niveau. |
+| Pourquoi des cosinus et des sinus ? | Ils décrivent une saison fixe avec peu de paramètres ; on en garde 2 vagues (K = 2, AIC minimal). |
+| Pourquoi p = 2 ? | La PACF des erreurs coupe au retard 2, l'AIC est minimal, et $\varphi_2$ est significatif. |
+| Comment le modèle est-il validé ? | Résidus en bruit blanc (Ljung-Box, p = 0,70) ; limite : normalité rejetée. |
+| Pourquoi pas un SARIMA ? | Testé : même précision, mais choix plus fragile et pas de niveau attendu interprétable. |
+| Comment fonctionne le Serfling ? | Base = droite + vague annuelle hors épidémie ; seuil = borne haute à 95 % ; 3 alertes, dont l'hiver 1975-76. |
+
+## Prochaine étape
+
+Un projet sur les **données de panel** : plusieurs individus (par exemple des régions ou des pays) suivis à plusieurs dates.
